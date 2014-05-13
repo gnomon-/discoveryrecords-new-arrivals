@@ -1,0 +1,201 @@
+#!/bin/bash
+
+declare    PROGNAME dir url cfg
+declare    fn_db fn_rules fmt
+declare -i ign r_o ret age now vrb
+declare -a rules prev
+
+PROGNAME="${0##*/}"
+
+dir="${HOME}/.discoveryrecords-new-arrivals"
+url='http://www.discoveryrecords.com/NEW.TXT'
+fn_db="data.sqlite3"
+fn_rules="queries.sql"
+
+function usage {
+	cat <<-_END_OF_USAGE_
+	${PROGNAME} - check for new LPs from Discovery Records
+
+	USAGE
+	  ${PROGNAME} [-h] [-a age] [-o] [-v] [-r/-R ...sql...]
+
+	OPTIONS
+
+	  -h	print these usage instructions and exit
+
+	  -a age
+	 	error if Discovery Records serves a file older
+	 	than the given age, which may be in any format
+	 	accepted by GNU date(1), eg. '500 minutes',
+	 	'10 days', etc.
+
+	 	(default: 7 days)
+
+	  -o	read-only; only query the existing database,
+	 	do not attempt to check for updates on the
+	 	Discovery Records site first.
+
+	  -r sql
+	 	run additional query 'sql' in addition to the
+	 	rules defined in the config file; may be used
+	 	more than once to run multiple queries
+
+	  -R sql
+	 	*only* run the queries from the command line,
+	 	ignore the config file.  (particularly useful
+	 	when used in conjunction with -o)
+
+	  -v	be verbose
+
+	_END_OF_USAGE_
+}
+
+function msg_exit {
+	declare -i ret=$1
+	[[ $ret == $1 ]] || ret=1
+	shift
+	printf '%s\n' "$@"
+	exit $ret
+}
+
+while getopts 'ha:or:R:v' OPT ; do case "$OPT" in
+  (h)	usage ; exit 0       ;;
+  (a)	age="$OPTARG"        ;;
+  (o)	r_o=1                ;;
+  (r)	rules+=( "$OPTARG" ) ;;
+  (R)	rules+=( "$OPTARG" )
+	ign=1                ;;
+  (v)	((vrb++))            ;;
+  (*)	echo "Unrecognized option: $OPT"
+	exit 1 ;;
+esac ; done ; shift $((OPTIND-1))
+
+[[ ${ign-UNSET} == UNSET ]] && ign=0
+
+if [[ ! -d $dir ]] ; then
+  mkdir ${vrb+-v} "$dir" || \
+    msg_exit 1 "could not create working directory"
+fi
+
+
+# this is where we would read in a config file, if we were going to do that,
+# but we're not.
+
+if ((! r_o)) ; then
+	now=$(date +'%s')
+	curl ${vrb+--verbose} -s -R -z "${dir}/data" \
+	  -D "${dir}/head.${now}.$$" \
+	  -o "${dir}/data.${now}.$$" \
+	  "$url"  2>&1 || \
+	    msg_exit 2 "curl could not retrieve new listing"
+
+	ret=$( \
+	  dos2unix < "${dir}/head.${now}.$$" | \
+	  awk '1==NR && /^HTTP\/1\.1 [0-9]+ /{print $2}'
+	)
+
+	case "$ret" in
+	  (304)	;; # no work to do, everything should be in place...
+
+	  (200)	ln -f${vrb+v} "${dir}/data.${now}.$$" "${dir}/data" 2>&1 || \
+		  msg_exit 4 'could not update data hardlink'
+		dos2unix < "${dir}/data" | awk '
+		BEGIN {
+			valid_hdr = valid_sep = valid_end = 0
+			artist = 1; title = 2; price = 3; qty = 4
+			code   = 5; date  = 6; other = 7
+			sql = ( \
+			  "create table if not exists headers (\n" \
+			  "\tts     integer,"  "\n" \
+			  "\tfn     text,"     "\n" \
+			  "\tval    blob"      "\n" \
+			  ");\n" \
+			  "drop table if exists items;\n" \
+			  "create table if not exists items (\n" \
+			  "\tartist text(25)," "\n" \
+			  "\ttitle  text(25)," "\n" \
+			  "\tprice  real,"     "\n" \
+			  "\tqty    integer,"  "\n" \
+			  "\tcode   text(12)," "\n" \
+			  "\tdate   integer,"  "\n" \
+			  "\tother  text(10)"  "\n" \
+			  ");\n" \
+			)
+			sql = sql "begin;\n"
+			sql = sql "insert into items (artist, title, price, " \
+			  "qty, code, date, other) values\n"
+		}
+
+		    1==NR && "Artist"==$1 && "Title"==$2 && "Price"==$3 &&
+		"Qty"==$4 && "Code"  ==$5 && "Date" ==$6 && "Other"==$7 {
+			valid_hdr = 1
+			next
+		}
+
+		2==NR && /^[ \x5F]+$/ && 95 == length($0) {
+			valid_sep = 1
+			next
+		}
+
+		NR>2 && 1 == length($0) && $0 ~ /^\x1A$/ {
+			valid_end = 1
+			next
+		}
+
+		{
+			d = $0
+			$artist = substr(d,  1, 25)
+			$title  = substr(d, 26, 25)
+			$price  = substr(d, 52,  6)
+			$qty    = substr(d, 59,  4)
+			$code   = substr(d, 64, 12)
+			$date   = substr(d, 77,  8)
+			$other  = substr(d, 86, 10)
+			$price += 0
+			$qty   += 0
+			for (i=1; i<=NF; i++) {
+				if (price == i || qty == i)
+					continue
+				 sub(/^ */,  "",   $i)
+				 sub(/ *$/,  "",   $i)
+				gsub(/\x27/, "&&", $i)
+			}
+			$date = ( \
+			  "20" substr($date, 7, 2) "-" \
+			       substr($date, 1, 2) "-" \
+			       substr($date, 4, 2)     \
+			)
+			sql = sql \
+			  sprintf(( \
+			    "(\x27%s\x27, \x27%s\x27, %.2f, %d, \x27%s\x27, " \
+			    "strftime(\x27%%s\x27, \x27%s\x27), \x27%s\x27),\n"), \
+			  $artist, $title, $price, $qty, $code, $date, $other)
+		}
+
+		END {
+			sub(/,\n$/, ";\n", sql)
+			print sql "commit;"
+		}' | sqlite3 "${dir}/${fn_db}" || \
+		  msg_exit 5 "could not update temporary database"
+		;;
+
+	  (*)	msg_exit 6 "unexpected HTTP return code $ret" ;;
+	esac
+
+	fmt='insert into headers (ts, fn, val) values (strftime("%%s","now"), '
+	fmt+=" \"%s\", x'%s');\n"
+	if ! printf "$fmt" "${dir}/head.${now}.$$" \
+	  "$(od -An -vtx1 "${dir}/head.${now}.$$" | \
+	    tr -d $' \n' | tr a-f A-F)" | \
+	  sqlite3 "${dir}/${fn_db}" ; then
+		msg_exit 7 "could not insert HTTP headers into database"
+	else
+		rm ${vrb+-v} -- "${dir}/head.${now}.$$" || \
+		  msg_exit 8 "could not delete temporary HTTP header file"
+	fi
+fi
+
+{
+	[[ $ign == 0 && -f ${dir}/${fn_rules} ]] && cat "${dir}/${fn_rules}"
+	printf '%s\n\n' "${rules[@]}"
+} | sqlite3 "${dir}/${fn_db}"
